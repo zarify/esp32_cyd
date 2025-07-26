@@ -128,7 +128,7 @@ Polling:
 ```python
 pos = touch.get_touch()
 if pos:
-    print(f"Touch at {pos['x']}, {pos['y']})
+    print(f"Touch at {pos['x']}, {pos['y']}")
 ```
 
 Callback:
