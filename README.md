@@ -43,7 +43,7 @@ Send a message:
 radio.send("G'day")
 ```
 
-Messages can be up to 254 bytes in length.
+Messages can be up to 248 bytes in length.
 
 Receive a message:
 
