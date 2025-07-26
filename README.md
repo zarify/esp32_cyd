@@ -20,7 +20,7 @@ landing in a good spot, striking a bit of a balance between simplicity and flexi
 details of the hardware - although I guess if you're using different boards there's some poking around to be done under the hood.
 
 ### easy_radio
-The ESP-NOW API is actually pretty good, but I wanted to make this very simple like the micro:bit, and just do broadcast with some light config in
+The ESP-NOW API is actually pretty good ([seriously, check it out](https://docs.micropython.org/en/latest/library/espnow.html)), but I wanted to make this very simple like the micro:bit, and just do broadcast with some light config in
 the form of channels, groups, and transmission power.
 
 Import and set up the radio:
