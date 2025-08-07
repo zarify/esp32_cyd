@@ -12,7 +12,10 @@ which is my gold standard for educational devices and code.
 
 > **Disclaimer:** I'm not a low level kinda guy, so these three libraries are heavily based on two things:
 > 1. Prior art - I referred to [this library](https://github.com/rdagger/micropython-ili9341) and the code provided in the [RNT examples](https://randomnerdtutorials.com/micropython-cheap-yellow-display-board-cyd-esp32-2432s028r/). Like half of the code floating around out there, particularly for microcontrollers, I don't know what the provenance is.
-> 2. A (un)healthy dose of Anthropic's Claude helping me along the way, sending me down rabbit holes, and very helpfully holding the gun when I want to shoot myself in the foot. Seriously though, this has been my first enjoyable foray into agentic coding.
+> 2. A (un)healthy dose of Anthropic's Claude helping me along the way, sending me down rabbit holes, and very helpfully holding the gun when I want to shoot myself in the foot. Seriously though, this has been my first enjoyable foray into agentic coding. This was partly an exercise in seeing what I could do with an agent workflow, and partly because I knew it would take longer than my attention span to do myself 😅
+
+This is an interesting method of indicating AI involvement from [BadgeAI](https://www.badgeai.org/):  
+![Text: T.AI.3](https://img.shields.io/badge/Text-T.AI.3-blue)
 
 ## Libraries
 There are three libraries here. I'm not making too many assumptions about code quality, but I tried to get the user-facing API
