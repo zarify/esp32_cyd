@@ -117,6 +117,9 @@ class Display:
         # Pixel buffer for performance optimization
         self._pixel_buffer = {}
         self._buffering_enabled = False
+        
+        # Color parsing cache for performance
+        self._color_cache = {}
 
         # Default pin configuration for ESP32-2432S028R (CYD)
         self._setup_display()
@@ -287,11 +290,58 @@ class Display:
             else:
                 return self.COLORS["white"]  # Default to white for unknown colors
         elif isinstance(color, (list, tuple)) and len(color) >= 3:
-            return color565(color[0], color[1], color[2])
+            # Use cache for RGB conversions
+            rgb_key = (color[0], color[1], color[2])
+            if rgb_key not in self._color_cache:
+                self._color_cache[rgb_key] = color565(color[0], color[1], color[2])
+            return self._color_cache[rgb_key]
         elif isinstance(color, int):
             return color
         else:
             return self.COLORS["white"]  # Default to white
+
+    def _validate_bounds(self, x, y):
+        """Validate coordinates are within screen bounds.
+        
+        Args:
+            x, y (int): Coordinates to validate
+            
+        Returns:
+            bool: True if coordinates are valid
+        """
+        return 0 <= x < self.width and 0 <= y < self.height
+
+    def _clip_rectangle(self, x, y, width, height):
+        """Clip rectangle to screen bounds.
+        
+        Args:
+            x, y (int): Top-left corner
+            width, height (int): Rectangle dimensions
+            
+        Returns:
+            tuple or None: (x, y, width, height) clipped values, or None if completely off-screen
+        """
+        x1 = max(0, x)
+        y1 = max(0, y)
+        x2 = min(self.width - 1, x + width - 1)
+        y2 = min(self.height - 1, y + height - 1)
+        
+        if x1 <= x2 and y1 <= y2:
+            return x1, y1, x2 - x1 + 1, y2 - y1 + 1
+        return None
+
+    def _prepare_color_data(self, color, count=1):
+        """Parse color and prepare byte data efficiently.
+        
+        Args:
+            color: Color to parse
+            count (int): Number of pixels worth of data to prepare
+            
+        Returns:
+            bytes: Color data ready for SPI transmission
+        """
+        color_val = self._parse_color(color)
+        return color_val.to_bytes(2, "big") * count
 
     MAX_BUFFERED_PIXELS = 500  # Safety limit
 
@@ -300,19 +350,35 @@ class Display:
         self._pixel_buffer.clear()
         self._buffering_enabled = True
 
+    def _smart_buffering(self, operation_count_estimate):
+        """Enable buffering only when beneficial.
+        
+        Args:
+            operation_count_estimate (int): Expected number of pixel operations
+            
+        Returns:
+            bool: True if buffering was started
+        """
+        # Only buffer for operations that benefit from it
+        if operation_count_estimate > 10 and not self._buffering_enabled:
+            self._start_buffering()
+            return True
+        return False
+
     def _buffered_pixel(self, x, y, color):
         """Add a pixel to the buffer or draw immediately."""
-        if not (0 <= x < self.width and 0 <= y < self.height):
+        if not self._validate_bounds(x, y):
             return
 
         color_val = self._parse_color(color)
 
         if self._buffering_enabled:
-            # Safety check: prevent memory exhaustion
+            # Safety check: prevent memory exhaustion, but don't flush mid-operation
             if len(self._pixel_buffer) >= self.MAX_BUFFERED_PIXELS:
-                # Flush current buffer and continue
-                self._flush_buffer()
-                self._start_buffering()
+                # Just draw this pixel directly instead of breaking the batch
+                pixel_data = color_val.to_bytes(2, "big")
+                self._block(x, y, x, y, pixel_data)
+                return
 
             self._pixel_buffer[(x, y)] = color_val
         else:
@@ -436,7 +502,6 @@ class Display:
             background: Background color (default: "black")
         """
         text_color = self._parse_color(color)
-        bg_color = self._parse_color(background)
 
         # Clear screen first
         self.clear(background)
@@ -453,11 +518,19 @@ class Display:
             lines = []
             for item in text:
                 item_str = str(item)
+                # Split each item on newlines first
                 item_lines = item_str.split("\n")
+                # Then wrap each line and add all wrapped lines to the final list
                 for line in item_lines:
                     lines.extend(self._wrap_text(line))
         else:
-            lines = [str(text)]
+            # Single non-string item
+            item_str = str(text)
+            lines = item_str.split("\n")
+            wrapped_lines = []
+            for line in lines:
+                wrapped_lines.extend(self._wrap_text(line))
+            lines = wrapped_lines
 
         # Display lines
         y = 5  # Start position
@@ -466,7 +539,8 @@ class Display:
         for line in lines:
             if y + 8 > self.height:  # Don't draw beyond screen
                 break
-            self._draw_text_8x8(5, y, line, text_color, bg_color)
+            # Use 0 for background since we already cleared the screen
+            self._draw_text_8x8(5, y, line, text_color, 0)
             y += line_height
 
     def show_text_at(self, x, y, text, color="white", background="black"):
@@ -483,7 +557,7 @@ class Display:
         bg_color = self._parse_color(background)
         self._draw_text_8x8(x, y, str(text), text_color, bg_color)
 
-    def _wrap_text(self, text, chars_per_line=40):
+    def _wrap_text(self, text, chars_per_line=38):
         """Wrap text to fit on screen."""
         if len(text) <= chars_per_line:
             return [text]
@@ -516,6 +590,10 @@ class Display:
         if x < 0 or y < 0 or x >= self.width or y >= self.height:
             return
 
+        # Handle empty text
+        if not text:
+            return
+
         w = len(text) * 8
         h = 8
 
@@ -523,10 +601,14 @@ class Display:
         buf = bytearray(w * 16)  # 16 bits per pixel
         fbuf = FrameBuffer(buf, w, h, RGB565)
 
+        # Always fill background to avoid random memory data corruption
         if background != 0:
             # Swap bytes for framebuffer endianness
             b_color = ((background & 0xFF) << 8) | ((background & 0xFF00) >> 8)
-            fbuf.fill(b_color)
+        else:
+            # Use black (0) as background but still fill the buffer
+            b_color = 0
+        fbuf.fill(b_color)
 
         # Swap bytes for framebuffer endianness
         t_color = ((color & 0xFF) << 8) | ((color & 0xFF00) >> 8)
@@ -553,12 +635,24 @@ class Display:
             x2, y2 (int): End coordinates
             color: Line color (default: "white")
         """
-        # Use buffering for better performance
-        self._start_buffering()
-
-        # Bresenham's line algorithm
+        # Optimize straight lines with direct block operations
+        if x1 == x2:  # Vertical line
+            self._draw_vertical_line(x1, y1, y2, color)
+            return
+        elif y1 == y2:  # Horizontal line  
+            self._draw_horizontal_line(x1, x2, y1, color)
+            return
+        
+        # For diagonal lines, use the original Bresenham algorithm
+        # Estimate number of pixels for smart buffering
         dx = abs(x2 - x1)
         dy = abs(y2 - y1)
+        pixel_count = max(dx, dy) + 1
+        
+        # Use smart buffering for better performance
+        was_buffering = self._smart_buffering(pixel_count)
+
+        # Bresenham's line algorithm
         x, y = x1, y1
         x_inc = 1 if x1 < x2 else -1
         y_inc = 1 if y1 < y2 else -1
@@ -576,7 +670,45 @@ class Display:
                 error += dx
                 y += y_inc
 
-        self._flush_buffer()
+        # Only flush if we started buffering
+        if was_buffering:
+            self._flush_buffer()
+
+    def _draw_horizontal_line(self, x1, x2, y, color):
+        """Draw a horizontal line efficiently with a single block operation."""
+        if not self._validate_bounds(x1, y) and not self._validate_bounds(x2, y):
+            return
+            
+        # Ensure x1 <= x2
+        if x1 > x2:
+            x1, x2 = x2, x1
+            
+        # Clip line to screen bounds
+        start_x = max(0, x1)
+        end_x = min(self.width - 1, x2)
+        
+        if start_x <= end_x and 0 <= y < self.height:
+            width = end_x - start_x + 1
+            line_data = self._prepare_color_data(color, width)
+            self._block(start_x, y, end_x, y, line_data)
+
+    def _draw_vertical_line(self, x, y1, y2, color):
+        """Draw a vertical line efficiently with a single block operation."""
+        if not self._validate_bounds(x, y1) and not self._validate_bounds(x, y2):
+            return
+            
+        # Ensure y1 <= y2
+        if y1 > y2:
+            y1, y2 = y2, y1
+            
+        # Clip line to screen bounds
+        start_y = max(0, y1)
+        end_y = min(self.height - 1, y2)
+        
+        if start_y <= end_y and 0 <= x < self.width:
+            height = end_y - start_y + 1
+            line_data = self._prepare_color_data(color, height)
+            self._block(x, start_y, x, end_y, line_data)
 
     def draw_rectangle(self, x, y, width, height, color="white", filled=False):
         """Draw a rectangle.
@@ -594,31 +726,38 @@ class Display:
         if filled:
             self.fill_rectangle(x, y, width, height, color)
         else:
-            # Draw outline efficiently using direct lines
-            color_val = self._parse_color(color)
+            # Draw outline efficiently using unified clipping
+            clipped = self._clip_rectangle(x, y, width, height)
+            if not clipped:
+                return
+                
+            clipped_x, clipped_y, clipped_width, clipped_height = clipped
 
-            # Clip to screen bounds
-            x1 = max(0, x)
-            y1 = max(0, y)
-            x2 = min(self.width - 1, x + width - 1)
-            y2 = min(self.height - 1, y + height - 1)
+            # Use optimized color data preparation
+            line_data_h = self._prepare_color_data(color, clipped_width)
 
-            if x1 <= x2 and y1 <= y2:
-                line_data_h = color_val.to_bytes(2, "big") * (x2 - x1 + 1)
-                line_data_v = color_val.to_bytes(2, "big")
+            # Draw horizontal lines (top and bottom)
+            if y >= 0 and y < self.height:
+                self._block(clipped_x, clipped_y, clipped_x + clipped_width - 1, clipped_y, line_data_h)  # Top
+            if y + height - 1 < self.height and y + height - 1 != clipped_y:
+                bottom_y = clipped_y + clipped_height - 1
+                self._block(clipped_x, bottom_y, clipped_x + clipped_width - 1, bottom_y, line_data_h)  # Bottom
 
-                # Top and bottom lines
-                if y >= 0 and y < self.height:
-                    self._block(x1, y1, x2, y1, line_data_h)  # Top
-                if y + height - 1 < self.height and y + height - 1 != y1:
-                    self._block(x1, y2, x2, y2, line_data_h)  # Bottom
-
-                # Left and right lines (excluding corners already drawn)
-                for row in range(y1 + 1, y2):
-                    if x >= 0 and x < self.width:
-                        self._block(x1, row, x1, row, line_data_v)  # Left
-                    if x + width - 1 < self.width and x + width - 1 != x1:
-                        self._block(x2, row, x2, row, line_data_v)  # Right
+            # Draw vertical lines (left and right) efficiently
+            vertical_height = clipped_height - 2  # Exclude corners already drawn by horizontal lines
+            if vertical_height > 0:
+                vertical_start_y = clipped_y + 1
+                vertical_end_y = clipped_y + clipped_height - 2
+                line_data_vertical = self._prepare_color_data(color, vertical_height)
+                
+                # Left vertical line
+                if x >= 0 and x < self.width:
+                    self._block(clipped_x, vertical_start_y, clipped_x, vertical_end_y, line_data_vertical)
+                
+                # Right vertical line (if different from left)
+                if x + width - 1 < self.width and x + width - 1 != clipped_x:
+                    right_x = clipped_x + clipped_width - 1
+                    self._block(right_x, vertical_start_y, right_x, vertical_end_y, line_data_vertical)
 
     def fill_rectangle(self, x, y, width, height, color="white"):
         """Draw a filled rectangle.
@@ -628,24 +767,22 @@ class Display:
             width, height (int): Rectangle dimensions
             color: Fill color (default: "white")
         """
-        color_val = self._parse_color(color)
+        # Use unified clipping
+        clipped = self._clip_rectangle(x, y, width, height)
+        if not clipped:
+            return
+            
+        x, y, width, height = clipped
 
-        # Clip to screen bounds
-        if x < 0:
-            width += x
-            x = 0
-        if y < 0:
-            height += y
-            y = 0
-        if x + width > self.width:
-            width = self.width - x
-        if y + height > self.height:
-            height = self.height - y
-
-        if width > 0 and height > 0:
-            # Create line data
-            line_data = color_val.to_bytes(2, "big") * width
-            # Draw each line
+        # Optimize for different rectangle sizes
+        if height <= 8:
+            # Small rectangle - single block operation
+            block_size = width * height
+            block_data = self._prepare_color_data(color, block_size)
+            self._block(x, y, x + width - 1, y + height - 1, block_data)
+        else:
+            # Large rectangle - line by line for memory efficiency
+            line_data = self._prepare_color_data(color, width)
             for row in range(height):
                 self._block(x, y + row, x + width - 1, y + row, line_data)
 
@@ -661,8 +798,9 @@ class Display:
         if filled:
             self.fill_circle(x, y, radius, color)
         else:
-            # Use buffering for better performance
-            self._start_buffering()
+            # Estimate pixel count for smart buffering (circumference approximation)
+            pixel_count = int(2 * 3.14159 * radius)
+            was_buffering = self._smart_buffering(pixel_count)
 
             # Bresenham's circle algorithm
             f = 1 - radius
@@ -694,7 +832,9 @@ class Display:
                 self._buffered_pixel(x + py, y - px, color)
                 self._buffered_pixel(x - py, y - px, color)
 
-            self._flush_buffer()
+            # Only flush if we started buffering
+            if was_buffering:
+                self._flush_buffer()
 
     def fill_circle(self, x, y, radius, color="white"):
         """Draw a filled circle.
@@ -704,23 +844,23 @@ class Display:
             radius (int): Circle radius
             color: Fill color (default: "white")
         """
-        color_val = self._parse_color(color)
-
         # Use scanline algorithm for efficiency - draw horizontal lines
         for dy in range(-radius, radius + 1):
             # Calculate half-width of circle at this y position
             half_width = int((radius * radius - dy * dy) ** 0.5)
 
             if half_width > 0:
-                # Draw horizontal line across the circle
-                start_x = max(0, x - half_width)
-                end_x = min(self.width - 1, x + half_width)
+                # Calculate line bounds
+                start_x = x - half_width
+                end_x = x + half_width
                 current_y = y + dy
 
-                if 0 <= current_y < self.height and start_x <= end_x:
-                    width = end_x - start_x + 1
-                    line_data = color_val.to_bytes(2, "big") * width
-                    self._block(start_x, current_y, end_x, current_y, line_data)
+                # Use unified clipping for the line
+                clipped = self._clip_rectangle(start_x, current_y, end_x - start_x + 1, 1)
+                if clipped:
+                    clip_x, clip_y, clip_width, clip_height = clipped
+                    line_data = self._prepare_color_data(color, clip_width)
+                    self._block(clip_x, clip_y, clip_x + clip_width - 1, clip_y, line_data)
 
     def _draw_ellipse_points(self, cx, cy, x, y, color_val):
         """Helper method to draw the 4 symmetric points of an ellipse."""
@@ -920,11 +1060,17 @@ class Display:
         """Turn the display on."""
         if hasattr(self, 'spi'):
             self._write_cmd(self.DISPLAY_ON)
+        # Turn backlight back on
+        if hasattr(self, 'backlight'):
+            self.backlight.on()
 
     def display_off(self):
         """Turn the display off.""" 
         if hasattr(self, 'spi'):
             self._write_cmd(self.DISPLAY_OFF)
+        # Turn backlight off to prevent white screen
+        if hasattr(self, 'backlight'):
+            self.backlight.off()
 
     def sleep(self, enable=True):
         """Enter or exit sleep mode.
@@ -960,6 +1106,16 @@ class Display:
 # Convenience functions for even simpler usage
 _default_display = None
 
+def _ensure_default_display(func_name):
+    """Decorator to ensure default display is initialized before calling function."""
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            global _default_display
+            if _default_display is None:
+                init()
+            return getattr(_default_display, func_name)(*args, **kwargs)
+        return wrapper
+    return decorator
 
 def init():
     """Initialize the default display instance."""
@@ -994,17 +1150,16 @@ def show_text_at(x, y, text, color="white", background="black"):
     _default_display.show_text_at(x, y, text, color, background)
 
 
+@_ensure_default_display("clear")
 def clear(color="black"):
     """Clear the default display.
 
     Args:
         color: Background color (default: "black")
     """
-    if _default_display is None:
-        init()
-    _default_display.clear(color)
+    pass  # Implementation handled by decorator
 
-
+@_ensure_default_display("draw_circle")
 def draw_circle(x, y, radius, color="white", filled=False):
     """Draw a circle using the default display.
 
@@ -1014,11 +1169,9 @@ def draw_circle(x, y, radius, color="white", filled=False):
         color: Circle color (default: "white")
         filled (bool): Whether to fill (default: False)
     """
-    if _default_display is None:
-        init()
-    _default_display.draw_circle(x, y, radius, color, filled)
+    pass  # Implementation handled by decorator
 
-
+@_ensure_default_display("draw_rectangle")
 def draw_rectangle(x, y, width, height, color="white", filled=False):
     """Draw a rectangle using the default display.
 
@@ -1028,25 +1181,19 @@ def draw_rectangle(x, y, width, height, color="white", filled=False):
         color: Rectangle color (default: "white")
         filled (bool): Whether to fill (default: False)
     """
-    if _default_display is None:
-        init()
-    _default_display.draw_rectangle(x, y, width, height, color, filled)
+    pass  # Implementation handled by decorator
 
-
+@_ensure_default_display("begin_drawing")
 def begin_drawing():
     """Begin buffered drawing for better performance."""
-    if _default_display is None:
-        init()
-    _default_display.begin_drawing()
+    pass  # Implementation handled by decorator
 
-
+@_ensure_default_display("end_drawing")
 def end_drawing():
     """End buffered drawing and flush to display."""
-    if _default_display is None:
-        init()
-    _default_display.end_drawing()
+    pass  # Implementation handled by decorator
 
-
+@_ensure_default_display("draw_pixel")
 def draw_pixel(x, y, color="white"):
     """Draw a pixel using the default display.
     
@@ -1054,11 +1201,9 @@ def draw_pixel(x, y, color="white"):
         x, y (int): Coordinates
         color: Pixel color (default: "white")
     """
-    if _default_display is None:
-        init()
-    _default_display.draw_pixel(x, y, color)
+    pass  # Implementation handled by decorator
 
-
+@_ensure_default_display("draw_line")
 def draw_line(x1, y1, x2, y2, color="white"):
     """Draw a line using the default display.
     
@@ -1067,11 +1212,9 @@ def draw_line(x1, y1, x2, y2, color="white"):
         x2, y2 (int): End coordinates
         color: Line color (default: "white")
     """
-    if _default_display is None:
-        init()
-    _default_display.draw_line(x1, y1, x2, y2, color)
+    pass  # Implementation handled by decorator
 
-
+@_ensure_default_display("draw_ellipse")
 def draw_ellipse(x, y, width, height, color="white", filled=False):
     """Draw an ellipse using the default display.
     
@@ -1082,11 +1225,9 @@ def draw_ellipse(x, y, width, height, color="white", filled=False):
         color: Ellipse color (default: "white")
         filled (bool): Whether to fill the ellipse (default: False)
     """
-    if _default_display is None:
-        init()
-    _default_display.draw_ellipse(x, y, width, height, color, filled)
+    pass  # Implementation handled by decorator
 
-
+@_ensure_default_display("draw_polygon")
 def draw_polygon(points, color="white", filled=False):
     """Draw a polygon using the default display.
     
@@ -1095,9 +1236,7 @@ def draw_polygon(points, color="white", filled=False):
         color: Polygon color (default: "white")
         filled (bool): Whether to fill the polygon (default: False)
     """
-    if _default_display is None:
-        init()
-    _default_display.draw_polygon(points, color, filled)
+    pass  # Implementation handled by decorator
 
 
 def display_on():

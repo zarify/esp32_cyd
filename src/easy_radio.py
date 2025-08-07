@@ -7,7 +7,7 @@ This library simplifies ESP-NOW communication for students by providing:
 - Group-based message filtering (like micro:bit radio groups)
 - Message queuing to prevent lost messages (handled automatically via callbacks)
 - Automatic peer management with RSSI
-- Channel configuration support with minimal interruption
+- Channel configuration support with minimal interruption  
 - WiFi TX power control for range adjustment
 - No async code required - messages arrive automatically in background
 
@@ -90,6 +90,21 @@ class Radio:
         # Initialize the radio
         self._init_radio()
     
+    def _validate_channel(self, channel):
+        """Validate WiFi channel parameter."""
+        if not (1 <= channel <= 13):
+            raise ValueError("Channel must be between 1 and 13")
+    
+    def _validate_power(self, tx_power):
+        """Validate TX power parameter."""
+        if not (1 <= tx_power <= 13):
+            raise ValueError("TX power must be between 1 and 13 dBm")
+    
+    def _validate_group(self, group):
+        """Validate radio group parameter."""
+        if not (0 <= group <= 255):
+            raise ValueError("Group must be between 0 (promiscuous) and 255")
+    
     def _init_radio(self):
         """Initialize the ESP-NOW radio interface."""
         try:
@@ -134,6 +149,29 @@ class Radio:
             self._last_error = f"Failed to initialize radio: {e}"
             raise RuntimeError(self._last_error)
     
+    def _parse_message(self, msg):
+        """Parse and validate received message format.
+        
+        Args:
+            msg (bytes): Raw message bytes
+            
+        Returns:
+            tuple or None: (msg_group, message_bytes) or None if invalid
+        """
+        if len(msg) < 2:
+            return None  # Invalid message - too short for header
+        
+        msg_group = msg[0]
+        msg_length = msg[1]
+        
+        # Validate message length is reasonable and matches actual message
+        if msg_length > 248 or len(msg) < (2 + msg_length):
+            return None  # Invalid message - length out of bounds or mismatch
+        
+        # Safe message extraction
+        message_bytes = msg[2:(2 + msg_length)]
+        return msg_group, message_bytes
+
     def _on_message_received(self, espnow_instance):
         """Background callback when ESP-NOW message arrives.
         
@@ -151,23 +189,16 @@ class Radio:
                 if mac is None:
                     break  # No more messages
                 
-                # Parse message header: [group][length][message...]
-                if len(msg) < 2:
-                    continue  # Invalid message - too short for header
+                # Parse and validate message using secure parser
+                parsed = self._parse_message(msg)
+                if parsed is None:
+                    continue  # Invalid message format
                 
-                msg_group = msg[0]
-                msg_length = msg[1]
-                
-                # Check if message length is valid
-                if len(msg) < (2 + msg_length):
-                    continue  # Invalid message - length mismatch
+                msg_group, message_bytes = parsed
                 
                 # Filter by group (unless we're in promiscuous mode)
                 if self._group != 0 and msg_group != self._group:
                     continue  # Not our group, ignore
-                
-                # Extract actual message content
-                message_bytes = msg[2:(2 + msg_length)]
                 
                 # Decode message
                 try:
@@ -204,7 +235,7 @@ class Radio:
         """Send a message to all nearby radios in the same group.
         
         Args:
-            message (str): The message to send (max 248 characters due to group header)
+            message (str): The message to send (max 248 bytes due to group header)
             
         Returns:
             bool: True if message was sent successfully, False otherwise
@@ -212,14 +243,23 @@ class Radio:
         if not isinstance(message, str):
             message = str(message)
         
-        # Limit message length (reserve 2 bytes for group header)
-        if len(message) > 248:
-            message = message[:248]
-        
         try:
             # Create message with group header
             # Format: [group_byte][length_byte][message_bytes]
             msg_bytes = message.encode('utf-8')
+            
+            # ESP-NOW max payload is 250 bytes, reserve 2 for header
+            if len(msg_bytes) > 248:
+                # Truncate by bytes to ensure valid UTF-8
+                msg_bytes = msg_bytes[:248]
+                # Ensure we don't break UTF-8 encoding
+                while len(msg_bytes) > 0:
+                    try:
+                        msg_bytes.decode('utf-8')
+                        break
+                    except UnicodeDecodeError:
+                        msg_bytes = msg_bytes[:-1]
+            
             header = bytes([self._group, len(msg_bytes)])
             full_message = header + msg_bytes
             
@@ -227,10 +267,12 @@ class Radio:
             broadcast_mac = b'\xff\xff\xff\xff\xff\xff'
             self._espnow.send(broadcast_mac, full_message, True)
             self._stats['sent'] += 1
+            return True
                 
         except Exception as e:
             self._stats['errors'] += 1
             self._last_error = f"Send error: {e}"
+            return False
     
     def receive(self, timeout_ms=0):
         """Check for received messages from the queue.
@@ -383,8 +425,7 @@ class Radio:
         Note: This will clear the message queue to prevent confusion
               about which channel messages were received on.
         """
-        if not (1 <= channel <= 13):
-            raise ValueError("Channel must be between 1 and 13")
+        self._validate_channel(channel)
         
         if self._channel == channel:
             return  # No change needed
@@ -419,8 +460,7 @@ class Radio:
         Note: This affects ESP-NOW transmission range. Higher values = longer range
               but more power consumption.
         """
-        if not (1 <= tx_power <= 13):
-            raise ValueError("TX power must be between 1 and 13 dBm")
+        self._validate_power(tx_power)
         
         if self._tx_power == tx_power:
             return  # No change needed
@@ -459,8 +499,7 @@ class Radio:
             
         Note: Only affects message filtering, no radio reinitialization needed
         """
-        if not (0 <= group <= 255):
-            raise ValueError("Group must be between 0 (promiscuous) and 255")
+        self._validate_group(group)
         
         self._group = group
     
@@ -492,6 +531,17 @@ class Radio:
 # Convenience functions for even simpler usage
 _default_radio = None
 
+def _ensure_default_radio(func_name):
+    """Decorator to ensure default radio is initialized before calling function."""
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            global _default_radio  
+            if _default_radio is None:
+                init()
+            return getattr(_default_radio, func_name)(*args, **kwargs)
+        return wrapper
+    return decorator
+
 def init(channel=None):
     """Initialize the default radio instance.
     
@@ -501,6 +551,7 @@ def init(channel=None):
     global _default_radio
     _default_radio = Radio(channel=channel)
 
+@_ensure_default_radio("send")
 def send(message):
     """Send a message using the default radio.
     
@@ -510,10 +561,9 @@ def send(message):
     Returns:
         bool: True if sent successfully
     """
-    if _default_radio is None:
-        init()
-    return _default_radio.send(message)
+    pass  # Implementation handled by decorator
 
+@_ensure_default_radio("receive")  
 def receive(timeout_ms=0):
     """Receive a message using the default radio.
     
@@ -523,12 +573,10 @@ def receive(timeout_ms=0):
     Returns:
         dict or None: Message info or None
     """
-    if _default_radio is None:
-        init()
-    return _default_radio.receive(timeout_ms)
+    pass  # Implementation handled by decorator
 
 def my_address():
-    """Get this device's MAC address.
+    """Get this device's MAC address using the default radio.
     
     Returns:
         str: MAC address
@@ -538,88 +586,80 @@ def my_address():
     return _default_radio.get_my_address()
 
 def stats():
-    """Get radio statistics.
+    """Get radio statistics using the default radio.
     
     Returns:
-        dict: Statistics
+        dict: Statistics including message counts and errors
     """
     if _default_radio is None:
         init()
     return _default_radio.get_stats()
 
+@_ensure_default_radio("receive_all")
 def receive_all():
     """Get all queued messages using the default radio.
     
     Returns:
         list: List of message dictionaries
     """
-    if _default_radio is None:
-        init()
-    return _default_radio.receive_all()
+    pass  # Implementation handled by decorator
 
+@_ensure_default_radio("clear_queue")
 def clear_queue():
     """Clear all queued messages using the default radio."""
-    if _default_radio is None:
-        init()
-    return _default_radio.clear_queue()
+    pass  # Implementation handled by decorator
 
+@_ensure_default_radio("queue_size")
 def queue_size():
     """Get number of queued messages using the default radio.
     
     Returns:
         int: Number of messages in queue
     """
-    if _default_radio is None:
-        init()
-    return _default_radio.queue_size()
+    pass  # Implementation handled by decorator
 
+@_ensure_default_radio("set_channel")
 def set_channel(channel):
     """Change channel using the default radio.
     
     Args:
         channel (int): Channel number (1-13)
     """
-    if _default_radio is None:
-        init()
-    return _default_radio.set_channel(channel)
+    pass  # Implementation handled by decorator
 
+@_ensure_default_radio("set_power")
 def set_power(tx_power):
     """Change TX power using the default radio.
     
     Args:
         tx_power (int): TX power level (1-13)
     """
-    if _default_radio is None:
-        init()
-    return _default_radio.set_power(tx_power)
+    pass  # Implementation handled by decorator
 
+@_ensure_default_radio("get_power")
 def get_power():
     """Get current TX power using the default radio.
     
     Returns:
         int: Current TX power level (1-13), or None if not set
     """
-    if _default_radio is None:
-        init()
-    return _default_radio.get_power()
+    pass  # Implementation handled by decorator
 
+@_ensure_default_radio("set_group")
 def set_group(group):
     """Change group using the default radio.
     
     Args:
         group (int): Group number (0=promiscuous, 1-255=group)
     """
-    if _default_radio is None:
-        init()
-    return _default_radio.set_group(group)
+    pass  # Implementation handled by decorator
 
+@_ensure_default_radio("get_group")
 def get_group():
     """Get current group using the default radio.
     
     Returns:
         int: Current group (0=promiscuous, 1-255=group number)
     """
-    if _default_radio is None:
-        init()
-    return _default_radio.get_group()
+    pass  # Implementation handled by decorator
 
