@@ -2,6 +2,8 @@
 
 The Easy Radio library makes wireless communication between ESP32 devices simple and straightforward, similar to the BBC micro:bit's radio functionality. It uses ESP-NOW protocol for fast, reliable communication without needing WiFi networks.
 
+On the devices I tested with, the default radio setup reached about 10m before I started noticing the occasional missed packet (around RSSI -60 or so).
+
 ## Quick Start
 
 ```python
@@ -136,7 +138,6 @@ while True:
 ```python
 from easy_radio import Radio
 
-# ONE radio instance per device
 radio = Radio(group=0)  # Base station in promiscuous mode
 
 # Sensors would each have their own ESP32 with:
