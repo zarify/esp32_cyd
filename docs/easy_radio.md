@@ -136,22 +136,16 @@ while True:
 ```python
 from easy_radio import Radio
 
-# Temperature sensors use group 10
-temp_radio = Radio(group=10)
+# ONE radio instance per device
+radio = Radio(group=0)  # Base station in promiscuous mode
 
-# Humidity sensors use group 20  
-humidity_radio = Radio(group=20)
+# Sensors would each have their own ESP32 with:
+# Device 1: radio = Radio(group=10)  # Temperature sensor
+# Device 2: radio = Radio(group=20)  # Humidity sensor
 
-# Base station listens to all groups
-base_radio = Radio(group=0)  # Promiscuous mode
-
-# Sensors send data
-temp_radio.send("Temperature: 23.5C")
-humidity_radio.send("Humidity: 65%")
-
-# Base station receives from all
+# Base station receives from all groups
 while True:
-    message = base_radio.receive()
+    message = radio.receive()
     if message:
         print(f"Group {message['group']}: {message['text']}")
 ```
